@@ -4,6 +4,7 @@ x-common-config: &common-config
     dockerfile: Dockerfile
   volumes:
     - ~/.nanobot:/home/nanobot/.nanobot
+  env_file: .env
   cap_drop:
     - ALL
   cap_add:
@@ -19,8 +20,8 @@ services:
     command: ["gateway"]
     restart: unless-stopped
     ports:
-      - 18790:18790
-      - 8765:8765
+      - "127.0.0.1:18790:18790"
+      - "127.0.0.1:8765:8765"
     deploy:
       resources:
         limits:
