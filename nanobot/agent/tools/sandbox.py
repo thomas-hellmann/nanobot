@@ -1,17 +1,20 @@
 """Sandbox backends for shell command execution.
 
 To add a new backend, implement a function with the signature:
-    _wrap_<name>(command: str, workspace: str, cwd: str) -> str
+    _wrap_<name>(command: str, workspace: str, cwd: str,
+                 allowed_env_keys: list[str] | None = None) -> str
 and register it in _BACKENDS below.
 """
 
+import os
 import shlex
 from pathlib import Path
 
 from nanobot.config.paths import get_media_dir
 
 
-def _bwrap(command: str, workspace: str, cwd: str) -> str:
+def _bwrap(command: str, workspace: str, cwd: str,
+           allowed_env_keys: list[str] | None = None) -> str:
     """Wrap command in a bubblewrap sandbox (requires bwrap in container).
 
     Only the workspace is bind-mounted read-write; its parent dir (which holds
@@ -38,6 +41,12 @@ def _bwrap(command: str, workspace: str, cwd: str) -> str:
     ]
 
     args = ["bwrap", "--new-session", "--die-with-parent", "--setenv", "HOME", str(ws)]
+
+    for key in (allowed_env_keys or []):
+        val = os.environ.get(key)
+        if val is not None:
+            args += ["--setenv", key, val]
+
     for p in required:
         args += ["--ro-bind", p, p]
     for p in optional:
@@ -57,8 +66,9 @@ def _bwrap(command: str, workspace: str, cwd: str) -> str:
 _BACKENDS = {"bwrap": _bwrap}
 
 
-def wrap_command(sandbox: str, command: str, workspace: str, cwd: str) -> str:
+def wrap_command(sandbox: str, command: str, workspace: str, cwd: str,
+                 allowed_env_keys: list[str] | None = None) -> str:
     """Wrap *command* using the named sandbox backend."""
     if backend := _BACKENDS.get(sandbox):
-        return backend(command, workspace, cwd)
+        return backend(command, workspace, cwd, allowed_env_keys)
     raise ValueError(f"Unknown sandbox backend {sandbox!r}. Available: {list(_BACKENDS)}")

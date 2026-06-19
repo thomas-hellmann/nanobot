@@ -410,7 +410,7 @@ class ExecTool(Tool):
                 )
             else:
                 workspace = workspace_root or cwd
-                command = wrap_command(self.sandbox, command, workspace, cwd)
+                command = wrap_command(self.sandbox, command, workspace, cwd, self.allowed_env_keys)
                 cwd = str(Path(workspace).resolve())
 
         effective_timeout = self._resolve_timeout(timeout)
