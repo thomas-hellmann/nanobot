@@ -205,6 +205,12 @@ class GithubChannel(BaseChannel):
         if not content or not self._http_client:
             return
 
+        # Skip progress, reasoning, and tool-hint messages – only post final
+        # responses to GitHub comments.
+        meta = msg.metadata or {}
+        if meta.get("_progress") or meta.get("_reasoning_delta") or meta.get("_tool_hint"):
+            return
+
         chat_id = msg.chat_id
         if "#" not in chat_id:
             self.logger.warning("Invalid GitHub chat_id: {}", chat_id)
