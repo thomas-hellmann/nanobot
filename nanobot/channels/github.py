@@ -126,6 +126,15 @@ class GithubChannel(BaseChannel):
         event_type = headers.get("x-github-event", "")
         body = data[header_end + 4:]
 
+        # Use Content-Length to trim body to exact bytes (avoids trailing
+        # data that would break HMAC verification).
+        content_length = headers.get("content-length")
+        if content_length:
+            try:
+                body = body[:int(content_length)]
+            except (ValueError, IndexError):
+                pass
+
         if self.config.webhook_secret:
             expected = "sha256=" + hmac.new(
                 self.config.webhook_secret.encode(), body, hashlib.sha256,
