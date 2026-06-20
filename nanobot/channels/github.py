@@ -104,7 +104,9 @@ class GithubChannel(BaseChannel):
         if self.config.app_id and self.config.private_key and self.config.installation_id:
             if self._installation_token and time.time() < self._token_expires_at - 60:
                 return self._installation_token
-            return await self._refresh_installation_token()
+            token = await self._refresh_installation_token()
+            if token:
+                return token
         if self.config.github_token:
             return self.config.github_token
         return None
@@ -113,7 +115,7 @@ class GithubChannel(BaseChannel):
         if not self._http_client:
             return None
         app_id = self.config.app_id
-        private_key = self.config.private_key
+        private_key = self.config.private_key.replace("\\n", "\n")
         install_id = self.config.installation_id
         if not app_id or not private_key or not install_id:
             return None
