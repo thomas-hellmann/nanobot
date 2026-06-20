@@ -193,7 +193,7 @@ class GithubChannel(BaseChannel):
             sender_id=sender_login,
             chat_id=chat_id,
             content=comment_body,
-            session_key_override=f"github:{chat_id}",
+            session_key=f"github:{chat_id}",
         )
         await self._send_response(writer, 200, "OK")
 
