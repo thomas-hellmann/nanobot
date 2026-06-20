@@ -51,7 +51,6 @@ class SlackConfig(Base):
     # before responding (so it only replies to mentions in approved channels,
     # instead of every message). No effect for "mention"/"open" policies.
     group_require_mention: bool = False
-    prefix_respond: dict[str, list[str]] = Field(default_factory=dict)
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
@@ -658,20 +657,11 @@ class SlackChannel(BaseChannel):
             return True
         return self._bot_user_id is not None and f"<@{self._bot_user_id}>" in text
 
-    def _has_prefix_trigger(self, chat_id: str, text: str) -> bool:
-        prefixes = self.config.prefix_respond.get(chat_id, [])
-        if not prefixes:
-            return False
-        stripped = text.strip()
-        return any(stripped.startswith(p) for p in prefixes)
-
     def _should_respond_in_channel(self, event_type: str, text: str, chat_id: str) -> bool:
         if self.config.group_policy == "open":
             return True
         if self.config.group_policy == "mention":
-            if self._is_mention(event_type, text):
-                return True
-            return self._has_prefix_trigger(chat_id, text)
+            return self._is_mention(event_type, text)
         if self.config.group_policy == "allowlist":
             if chat_id not in self.config.group_allow_from:
                 return False
