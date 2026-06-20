@@ -45,6 +45,9 @@ class GithubChannel(BaseChannel):
     send_tool_hints = False
     show_reasoning = False
 
+    def is_allowed(self, sender_id: str) -> bool:
+        return True
+
     @classmethod
     def default_config(cls) -> dict[str, Any]:
         return GithubConfig().model_dump(by_alias=True)
