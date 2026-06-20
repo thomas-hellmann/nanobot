@@ -36,7 +36,7 @@ Messages flow through an async `MessageBus` (`nanobot/bus/queue.py`) that decoup
 
 - **Agent Loop** (`nanobot/agent/loop.py`, `runner.py`): The core processing engine. `AgentLoop` manages session keys, hooks, and context building. `AgentRunner` executes the multi-turn LLM conversation with tool execution.
 - **LLM Providers** (`nanobot/providers/`): Provider implementations (Anthropic, OpenAI-compatible, OpenAI Responses API, Azure, Bedrock, GitHub Copilot, OpenAI Codex, etc.) built on a common base (`base.py`). Includes image generation (`image_generation.py`) and audio transcription (`transcription.py`). `factory.py` and `registry.py` handle instantiation and model discovery.
-- **Channels** (`nanobot/channels/`): Platform integrations (Telegram, Discord, Slack, Feishu, Matrix, WhatsApp, QQ, WeChat, WeCom, DingTalk, Email, MoChat, MS Teams, WebSocket). `manager.py` discovers and coordinates them. Channels are auto-discovered via `pkgutil` scan + entry-point plugins.
+- **Channels** (`nanobot/channels/`): Platform integrations (Telegram, Discord, Slack, Feishu, Matrix, WhatsApp, QQ, WeChat, WeCom, DingTalk, Email, GitHub, MoChat, MS Teams, WebSocket). `manager.py` discovers and coordinates them. Channels are auto-discovered via `pkgutil` scan + entry-point plugins.
 - **Tools** (`nanobot/agent/tools/`): Agent capabilities exposed to the LLM: filesystem (read/write/edit/list), shell execution (with sandbox backends), web search/fetch, MCP servers, cron, notebook editing, subagent spawning, long-running tasks / sustained goals (`long_task.py`), image generation, and self-modification. Tools are auto-discovered via `pkgutil` scan + entry-point plugins.
 - **Memory** (`nanobot/agent/memory.py`): Session history persistence with Dream two-phase memory consolidation. Uses atomic writes with fsync for durability.
 - **Session Management** (`nanobot/session/`): Per-session history, context compaction, TTL-based auto-compaction (`manager.py`), and sustained goal state tracking (`goal_state.py`).
@@ -54,6 +54,85 @@ Messages flow through an async `MessageBus` (`nanobot/bus/queue.py`) that decoup
 
 - **CLI**: `nanobot/cli/commands.py`
 - **Python SDK**: `nanobot/nanobot.py`
+
+## Fork-Specific Changes (thomas-hellmann/nanobot)
+
+### GitHub Channel (`nanobot/channels/github.py`)
+
+A new channel that receives GitHub webhooks and posts comments to issues/PRs.
+
+**Config (`~/.nanobot/config.json`):**
+```json
+"channels": {
+  "github": {
+    "enabled": true,
+    "webhookSecret": "${GH_WEBHOOK_SECRET}",
+    "appId": "${GITHUB_APP_ID}",
+    "privateKey": "${GITHUB_APP_PRIVATE_KEY}",
+    "installationId": "${GITHUB_INSTALLATION_ID}",
+    "port": 8080
+  }
+}
+```
+
+- Listens on `POST /webhook` for `issue_comment` events
+- Responds only to comments starting with `/nanobot`
+- Uses GitHub App installation token (falls back to `githubToken` PAT)
+- Session per issue/PR (`github:owner/repo#123`)
+
+### GitHub App Auth
+
+- `githubToken` (PAT) → comments appear as token owner
+- `appId` + `privateKey` + `installationId` → comments appear as `nanobot[bot]`
+- App token is refreshed every hour (cached, renewed 60s before expiry)
+- Private key in `.env` uses `\n` literal newlines (normalized in code)
+
+### bwrap Sandbox: Env Variable Forwarding
+
+**`nanobot/agent/tools/sandbox.py`** and **`nanobot/agent/tools/shell.py`** modified to pass container env vars into the bwrap sandbox.
+
+**Config:**
+```json
+"tools": {
+  "exec": {
+    "sandbox": "bwrap",
+    "allowedEnvKeys": ["GH_TOKEN", "GITHUB_TOKEN"]
+  }
+}
+```
+
+- `_bwrap()` now adds `--setenv KEY VALUE` for each key in `allowed_env_keys`
+- `_prepare_command()` passes `self.allowed_env_keys` to `wrap_command()`
+
+### Optional Dependency Group
+
+**`pyproject.toml`** has a new `[github]` extra:
+```toml
+github = [
+    "PyJWT>=2.0,<3.0",
+    "cryptography>=41.0",
+]
+```
+
+Install with: `pip install "nanobot-ai[github]"` or in Dockerfile: `uv pip install --system ".[github]"`.
+
+### Docker Compose (nginx-proxy)
+
+```yaml
+environment:
+  - VIRTUAL_HOST=nanobot.th-dev.eu
+  - VIRTUAL_PORT=8080
+  - LETSENCRYPT_HOST=nanobot.th-dev.eu
+networks:
+  - default
+  - proxy-net
+```
+
+### Secrets Strategy
+
+All secrets in `~/.nanobot/.env` file, referenced in `config.json` via `${VAR_NAME}`:
+- `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `GH_TOKEN`, `GH_WEBHOOK_SECRET`, `GITHUB_APP_ID`, `GITHUB_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY`, `NANOBOT_WEBUI_SECRET`
+- `.env` is in `.gitignore` and `.dockerignore`
 
 ## Project-Specific Notes
 
