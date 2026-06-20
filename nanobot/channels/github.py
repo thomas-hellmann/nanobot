@@ -126,6 +126,12 @@ class GithubChannel(BaseChannel):
         event_type = headers.get("x-github-event", "")
         body = data[header_end + 4:]
 
+        self.logger.debug(
+            "Webhook: event={} sig={} body_len={} secret_set={}",
+            event_type, signature[:20] if signature else "(none)",
+            len(body), bool(self.config.webhook_secret),
+        )
+
         # Use Content-Length to trim body to exact bytes (avoids trailing
         # data that would break HMAC verification).
         content_length = headers.get("content-length")
@@ -150,8 +156,11 @@ class GithubChannel(BaseChannel):
 
         try:
             payload = json.loads(body)
-        except json.JSONDecodeError:
-            await self._send_response(writer, 400, "Invalid JSON")
+        except json.JSONDecodeError as e:
+            self.logger.error(
+                "GitHub JSON error: {} body[:300]={!r}", e, body[:300],
+            )
+            await self._send_response(writer, 400, f"Invalid JSON: {e}")
             return
 
         if payload.get("action") != "created":
