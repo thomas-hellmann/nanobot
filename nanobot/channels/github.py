@@ -101,11 +101,13 @@ class GithubChannel(BaseChannel):
             await self._http_client.aclose()
 
     async def _ensure_token(self) -> str | None:
+        if self.config.app_id and self.config.private_key and self.config.installation_id:
+            if self._installation_token and time.time() < self._token_expires_at - 60:
+                return self._installation_token
+            return await self._refresh_installation_token()
         if self.config.github_token:
             return self.config.github_token
-        if self._installation_token and time.time() < self._token_expires_at - 60:
-            return self._installation_token
-        return await self._refresh_installation_token()
+        return None
 
     async def _refresh_installation_token(self) -> str | None:
         if not self._http_client:
