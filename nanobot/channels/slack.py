@@ -340,8 +340,11 @@ class SlackChannel(BaseChannel):
 
         subtype = event.get("subtype")
         # Slack uses subtype=file_share for user messages with attachments.
-        # Ignore other subtypes such as bot_message / message_changed / deleted.
-        if subtype and subtype != "file_share":
+        # Allow bot_message for channels with prefix triggers.
+        # Ignore other subtypes such as message_changed / deleted.
+        if subtype and subtype not in ("file_share", "bot_message"):
+            return
+        if subtype == "bot_message" and chat_id not in self.config.prefix_respond:
             return
         if self._bot_user_id and sender_id == self._bot_user_id:
             return
@@ -377,7 +380,7 @@ class SlackChannel(BaseChannel):
                 )
             return
 
-        if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
+        if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id, event):
             return
 
         text = self._strip_bot_mention(text)
@@ -658,20 +661,43 @@ class SlackChannel(BaseChannel):
             return True
         return self._bot_user_id is not None and f"<@{self._bot_user_id}>" in text
 
-    def _has_prefix_trigger(self, chat_id: str, text: str) -> bool:
+    def _has_prefix_trigger(self, chat_id: str, text: str, event: dict | None = None) -> bool:
         prefixes = self.config.prefix_respond.get(chat_id, [])
         if not prefixes:
             return False
-        stripped = text.strip()
-        return any(stripped.startswith(p) for p in prefixes)
+        candidates = [text]
+        if event:
+            for block in (event.get("blocks") or []):
+                self._collect_block_text(block, candidates)
+            for attachment in (event.get("attachments") or []):
+                self._collect_block_text(attachment, candidates)
+        return any(
+            stripped.startswith(p)
+            for c in candidates
+            if (stripped := c.strip())
+            for p in prefixes
+        )
 
-    def _should_respond_in_channel(self, event_type: str, text: str, chat_id: str) -> bool:
+    @staticmethod
+    def _collect_block_text(block: dict, texts: list[str]) -> None:
+        if isinstance(block, dict):
+            for value in block.values():
+                if isinstance(value, str):
+                    texts.append(value)
+                elif isinstance(value, dict):
+                    SlackChannel._collect_block_text(value, texts)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            SlackChannel._collect_block_text(item, texts)
+
+    def _should_respond_in_channel(self, event_type: str, text: str, chat_id: str, event: dict | None = None) -> bool:
         if self.config.group_policy == "open":
             return True
         if self.config.group_policy == "mention":
             if self._is_mention(event_type, text):
                 return True
-            return self._has_prefix_trigger(chat_id, text)
+            return self._has_prefix_trigger(chat_id, text, event)
         if self.config.group_policy == "allowlist":
             if chat_id not in self.config.group_allow_from:
                 return False
