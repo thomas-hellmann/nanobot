@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import hmac
 import json
+import time
 from typing import Any
 
 import httpx
+import jwt
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -22,6 +24,9 @@ class GithubConfig(Base):
     enabled: bool = False
     webhook_secret: str = ""
     github_token: str = ""
+    app_id: str = ""
+    private_key: str = ""
+    installation_id: str = ""
     host: str = "0.0.0.0"
     port: int = 8080
 
@@ -59,14 +64,17 @@ class GithubChannel(BaseChannel):
         self.config: GithubConfig = config
         self._server: asyncio.AbstractServer | None = None
         self._http_client: httpx.AsyncClient | None = None
+        self._installation_token: str | None = None
+        self._token_expires_at: float = 0.0
 
     async def start(self) -> None:
-        if not self.config.github_token:
-            self.logger.warning("GitHub token not configured, channel disabled")
+        has_pat = bool(self.config.github_token)
+        has_app = bool(self.config.app_id and self.config.private_key and self.config.installation_id)
+        if not has_pat and not has_app:
+            self.logger.warning("GitHub channel: no token or app credentials configured, skipping")
             return
         self._http_client = httpx.AsyncClient(
             headers={
-                "Authorization": f"Bearer {self.config.github_token}",
                 "Accept": "application/vnd.github.v3+json",
                 "User-Agent": "nanobot",
             },
@@ -91,6 +99,47 @@ class GithubChannel(BaseChannel):
             await self._server.wait_closed()
         if self._http_client:
             await self._http_client.aclose()
+
+    async def _ensure_token(self) -> str | None:
+        if self.config.github_token:
+            return self.config.github_token
+        if self._installation_token and time.time() < self._token_expires_at - 60:
+            return self._installation_token
+        return await self._refresh_installation_token()
+
+    async def _refresh_installation_token(self) -> str | None:
+        if not self._http_client:
+            return None
+        app_id = self.config.app_id
+        private_key = self.config.private_key
+        install_id = self.config.installation_id
+        if not app_id or not private_key or not install_id:
+            return None
+
+        now = int(time.time())
+        jwt_token = jwt.encode(
+            {"iat": now - 60, "exp": now + 600, "iss": app_id},
+            private_key,
+            algorithm="RS256",
+        )
+
+        try:
+            resp = await self._http_client.post(
+                f"https://api.github.com/app/installations/{install_id}/access_tokens",
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
+            if resp.is_error:
+                self.logger.error(
+                    "GitHub App token error: {} {}", resp.status_code, resp.text[:300],
+                )
+                return None
+            data = resp.json()
+            self._installation_token = data["token"]
+            self._token_expires_at = time.time() + data.get("expires_in", 3600)
+            return self._installation_token
+        except Exception as e:
+            self.logger.error("GitHub App token refresh error: {}", e)
+            return None
 
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -211,6 +260,11 @@ class GithubChannel(BaseChannel):
         if meta.get("_progress") or meta.get("_reasoning_delta") or meta.get("_tool_hint"):
             return
 
+        token = await self._ensure_token()
+        if not token:
+            self.logger.error("No GitHub auth token available, cannot send")
+            return
+
         chat_id = msg.chat_id
         if "#" not in chat_id:
             self.logger.warning("Invalid GitHub chat_id: {}", chat_id)
@@ -226,7 +280,10 @@ class GithubChannel(BaseChannel):
         body = content[:65000]
 
         try:
-            resp = await self._http_client.post(url, json={"body": body})
+            resp = await self._http_client.post(
+                url, json={"body": body},
+                headers={"Authorization": f"Bearer {token}"},
+            )
             if resp.is_error:
                 self.logger.error(
                     "GitHub send failed: {} {}", resp.status_code, resp.text[:300],
