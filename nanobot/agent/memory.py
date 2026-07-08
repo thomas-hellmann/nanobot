@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
     from nanobot.session.manager import SessionManager
 
-
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
@@ -42,6 +41,14 @@ class MemoryStore:
     """Pure file I/O for memory files: MEMORY.md, history.jsonl, SOUL.md, USER.md."""
 
     _DEFAULT_MAX_HISTORY = 1000
+    # Durable files whose real working-tree delta grounds Dream commit messages
+    # and the cursor-advance gate. Deliberately excludes memory/.dream_cursor so
+    # that advancing the cursor itself is never mistaken for a productive edit.
+    _DREAM_CONTENT_PATHS = ("SOUL.md", "USER.md", "memory/MEMORY.md")
+    # Per-file cap when embedding current contents into the Dream prompt. The
+    # durable files are tiny in practice (~5 KB total), but a runaway file must
+    # not unbounded the prompt.
+    _DREAM_FILE_EMBED_CAP = 8000
     _INTERNAL_HISTORY_SESSION_PREFIXES = ("cron:", "dream:")
     _INTERNAL_HISTORY_SESSION_KEYS = {"heartbeat"}
     _LEGACY_ENTRY_START_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*")
@@ -61,9 +68,10 @@ class MemoryStore:
         self.user_file = workspace / "USER.md"
         self._cursor_file = self.memory_dir / ".cursor"
         self._dream_cursor_file = self.memory_dir / ".dream_cursor"
-        self._corruption_logged = False  # rate-limit non-int cursor warning
+        self._corruption_logged = False  # rate-limit invalid cursor warning
         self._malformed_entry_logged = False  # rate-limit bad history shape warning
         self._oversize_logged = False  # rate-limit oversized-entry warning
+        self._dream_prompt_oversize_logged = False
         self._append_lock = threading.Lock()  # serialize cursor allocation + append
         self._git = GitStore(workspace, tracked_files=[
             "SOUL.md", "USER.md", "memory/MEMORY.md", "memory/.dream_cursor",
@@ -291,8 +299,8 @@ class MemoryStore:
 
     @staticmethod
     def _valid_cursor(value: Any) -> int | None:
-        """Int cursors only — reject bool (``isinstance(True, int)`` is True)."""
-        if isinstance(value, bool) or not isinstance(value, int):
+        """Non-negative int cursors only; reject bool (``isinstance(True, int)`` is True)."""
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return None
         return value
 
@@ -315,7 +323,7 @@ class MemoryStore:
         if poisoned is not None and not self._corruption_logged:
             self._corruption_logged = True
             logger.warning(
-                "history.jsonl contains a non-int cursor ({!r}); dropping it. "
+                "history.jsonl contains an invalid cursor ({!r}); dropping it. "
                 "Usually caused by an external writer; further occurrences suppressed.",
                 poisoned,
             )
@@ -336,18 +344,32 @@ class MemoryStore:
         session_key = entry.get("session_key")
         return session_key is None or isinstance(session_key, str)
 
+    def _read_cursor_counter(self) -> int | None:
+        """Return the persisted cursor counter when it is usable."""
+        if not self._cursor_file.exists():
+            return None
+        with suppress(ValueError, OSError):
+            cursor = int(self._cursor_file.read_text(encoding="utf-8").strip())
+            if cursor >= 0:
+                return cursor
+        return None
+
     def _next_cursor(self) -> int:
         """Read the current cursor counter and return the next value."""
-        if self._cursor_file.exists():
-            with suppress(ValueError, OSError):
-                return int(self._cursor_file.read_text(encoding="utf-8").strip()) + 1
+        cursor_counter = self._read_cursor_counter()
+        last = self._read_last_entry() or {}
+        last_cursor = self._valid_cursor(last.get("cursor"))
+        if cursor_counter is not None:
+            if last_cursor is not None:
+                return max(cursor_counter, last_cursor) + 1
+            max_history_cursor = max((c for _, c in self._iter_valid_entries()), default=0)
+            return max(cursor_counter, max_history_cursor) + 1
+
         # Fast path: trust the tail when intact.  Otherwise scan the whole
         # file and take ``max`` — that stays correct even if the monotonic
         # invariant was broken by external writes.
-        last = self._read_last_entry() or {}
-        cursor = self._valid_cursor(last.get("cursor"))
-        if cursor is not None:
-            return cursor + 1
+        if last_cursor is not None:
+            return last_cursor + 1
         return max((c for _, c in self._iter_valid_entries()), default=0) + 1
 
     def read_unprocessed_history(self, since_cursor: int) -> list[dict[str, Any]]:
@@ -465,13 +487,57 @@ class MemoryStore:
     def set_last_dream_cursor(self, cursor: int) -> None:
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
 
+    def get_latest_cursor(self) -> int:
+        return max(self._next_cursor() - 1, 0)
+
+    @property
+    def dream_prompt_file(self) -> Path:
+        return self.workspace / "prompts" / "dream.md"
+
+    def has_dream_prompt_override(self) -> bool:
+        with suppress(OSError):
+            return self.dream_prompt_file.is_file() and bool(
+                self.dream_prompt_file.read_text(encoding="utf-8").strip()
+            )
+        return False
+
+    @staticmethod
+    def default_dream_prompt() -> str:
+        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+
+        return render_template(
+            "agent/dream.md",
+            strip=True,
+            skill_creator_path=str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md"),
+        )
+
+    def _dream_template(self) -> str:
+        with suppress(OSError):
+            text = self.dream_prompt_file.read_text(encoding="utf-8")
+            if text.strip():
+                text = text.rstrip()
+                if len(text) > _DREAM_PROMPT_MAX_CHARS:
+                    if not self._dream_prompt_oversize_logged:
+                        self._dream_prompt_oversize_logged = True
+                        logger.warning(
+                            "workspace Dream prompt exceeds {} chars ({}); truncating. "
+                            "Further occurrences suppressed.",
+                            _DREAM_PROMPT_MAX_CHARS, len(text),
+                        )
+                    return truncate_text(text, _DREAM_PROMPT_MAX_CHARS)
+                return text
+        return self.default_dream_prompt()
+
     def build_dream_prompt(self, *, max_entries: int = 20) -> tuple[str, int] | None:
         """Build the Dream prompt with unprocessed history context.
 
         Returns ``(prompt, last_cursor)`` or ``None`` if nothing to process.
-        """
-        from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
+        The current contents of the durable memory files (SOUL.md, USER.md,
+        memory/MEMORY.md) are embedded so the model edits the real files rather
+        than a stale mental model — eliminating a class of failed/out-of-bounds
+        edits that previously produced hallucinated audit records.
+        """
         last_cursor = self.get_last_dream_cursor()
         entries = self.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
@@ -482,12 +548,46 @@ class MemoryStore:
             f"[{e['timestamp']}] {truncate_text(e['content'], 500)}"
             for e in batch
         )
-        skill_creator_path = str(BUILTIN_SKILLS_DIR / "skill-creator" / "SKILL.md")
-        template = render_template(
-            "agent/dream.md", strip=True, skill_creator_path=skill_creator_path,
+        template = self._dream_template()
+        files_section = self._render_current_memory_files()
+        prompt = (
+            f"{template}\n\n{files_section}\n\n"
+            f"## Conversation History\n{history_text}"
         )
-        prompt = f"{template}\n\n## Conversation History\n{history_text}"
         return (prompt, batch[-1]["cursor"])
+
+    def _render_current_memory_files(self) -> str:
+        """Render the durable memory files' current contents for the Dream prompt.
+
+        Missing files render as ``(empty)``; oversized files are capped. The
+        section is the ground truth the model must edit against.
+        """
+        files = [
+            ("SOUL.md", self.soul_file),
+            ("USER.md", self.user_file),
+            ("memory/MEMORY.md", self.memory_file),
+        ]
+        blocks = []
+        for label, path in files:
+            try:
+                content = path.read_text(encoding="utf-8") if path.exists() else ""
+            except OSError:
+                content = ""
+            if len(content) > self._DREAM_FILE_EMBED_CAP:
+                content = truncate_text(content, self._DREAM_FILE_EMBED_CAP) + "\n...[truncated]"
+            blocks.append(f"### {label}\n{content}" if content.strip() else f"### {label}\n(empty)")
+        return "## Current Memory Files\n" + "\n\n".join(blocks)
+
+    def dream_content_diff(self) -> str:
+        """Structured summary of uncommitted changes to the durable memory files.
+
+        Returns "" when git is unavailable or no content file changed. This is
+        the ground-truth input for diff-grounded Dream commit messages and for
+        gating cursor advance on real edits (never on LLM self-report).
+        """
+        if not self._git.is_initialized():
+            return ""
+        return self._git.summarize_working_tree(list(self._DREAM_CONTENT_PATHS))
 
     def build_dream_tools(self):
         """Build the restricted tool registry used by Dream runs."""
@@ -580,12 +680,22 @@ class MemoryStore:
         return f"dream:{datetime.now():%Y%m%d-%H%M%S}"
 
     @staticmethod
-    def build_dream_commit_message(prefix: str, resp: object | None) -> str:
-        """Build a Dream auto-commit message, appending the LLM summary if present."""
-        msg = prefix
-        if resp is not None and getattr(resp, "content", None):
-            msg = f"{msg}\n\n{resp.content.strip()}"
-        return msg
+    def build_dream_commit_message(prefix: str, diff_body: str) -> str:
+        """Build a Dream commit message grounded in the real working-tree diff.
+
+        *diff_body* is a structured, machine-derived summary of the actual file
+        changes (see :meth:`dream_content_diff` /
+        :meth:`GitStore.summarize_working_tree`). The LLM narrative is
+        deliberately excluded so the audit record (``/dream-log``) reflects the
+        filesystem's truth, not the model's self-report.
+
+        An empty *diff_body* yields the bare *prefix*, which ``auto_commit``
+        turns into a no-op when there is nothing to stage.
+        """
+        diff_body = (diff_body or "").strip()
+        if not diff_body:
+            return prefix
+        return f"{prefix}\n\n{diff_body}"
 
     @staticmethod
     def prune_dream_sessions(sessions_dir: Path, *, keep: int = 10) -> None:
@@ -618,6 +728,7 @@ class MemoryStore:
 # that catches any new caller that forgot to set its own cap.
 _RAW_ARCHIVE_MAX_CHARS = 16_000       # fallback dump (LLM failed)
 _ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced consolidation summary
+_DREAM_PROMPT_MAX_CHARS = 32_000      # workspace-local Dream prompt override
 _HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
 
 
@@ -695,17 +806,12 @@ class Consolidator:
     @staticmethod
     def _full_unconsolidated_history(
         session: Session,
-        *,
-        include_timestamps: bool = False,
     ) -> list[dict[str, Any]]:
         """Return the whole unconsolidated tail for consolidation decisions."""
         unconsolidated_count = len(session.messages) - session.last_consolidated
         if unconsolidated_count <= 0:
             return []
-        return session.get_history(
-            max_messages=unconsolidated_count,
-            include_timestamps=include_timestamps,
-        )
+        return session.get_history(max_messages=unconsolidated_count)
 
     @staticmethod
     def _replay_overflow_boundary(
@@ -780,7 +886,7 @@ class Consolidator:
         session: Session,
     ) -> tuple[int, str]:
         """Estimate prompt size from the full unconsolidated session tail."""
-        history = self._full_unconsolidated_history(session, include_timestamps=True)
+        history = self._full_unconsolidated_history(session)
         channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
         # Include archived summary in estimation so the budget accounts for it.
         meta = session.metadata.get("_last_summary")
@@ -994,7 +1100,6 @@ class Consolidator:
 
             messages_to_summarize = list(session.messages[session.last_consolidated:])
             if not messages_to_summarize:
-                session.updated_at = datetime.now()
                 self.sessions.save(session)
                 return ""
 
@@ -1006,12 +1111,11 @@ class Consolidator:
                 metadata={},
                 last_consolidated=0,
             )
-            dropped, already_consolidated = probe.retain_recent_legal_suffix(max_suffix, extend_to_user=True)
+            result = probe.retain_recent_legal_suffix(max_suffix, extend_to_user=True)
             messages_to_keep = probe.messages
-            messages_to_remove = dropped[already_consolidated:]
+            messages_to_remove = result.dropped[result.already_consolidated_count:]
 
             if not messages_to_remove and not messages_to_keep:
-                session.updated_at = datetime.now()
                 self.sessions.save(session)
                 return ""
 
@@ -1034,7 +1138,6 @@ class Consolidator:
 
             session.messages = messages_to_keep
             session.last_consolidated = 0
-            session.updated_at = datetime.now()
             self.sessions.save(session)
 
             if messages_to_remove:
