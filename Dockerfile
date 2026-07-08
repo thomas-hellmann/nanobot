@@ -34,7 +34,7 @@ RUN mkdir -p nanobot && touch nanobot/__init__.py && \
 # Copy the full source and install
 COPY nanobot/ nanobot/
 COPY --from=webui-builder /app/nanobot/web/dist/ nanobot/web/dist/
-RUN NANOBOT_SKIP_WEBUI_BUILD=1 uv pip install --system --no-cache ".[whatsapp,github]"
+RUN NANOBOT_SKIP_WEBUI_BUILD=1 uv pip install --system --no-cache ".[whatsapp,github,slack]"
 
 # Create non-root user and config directory
 RUN useradd -m -u 1000 -s /bin/bash nanobot && \
