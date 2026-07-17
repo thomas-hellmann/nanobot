@@ -56,6 +56,12 @@ Messages flow through an async `MessageBus` (`nanobot/bus/queue.py`) that decoup
 
 ## Fork-Specific Changes (thomas-hellmann/nanobot)
 
+### Docker & WebUI
+
+- `channels.websocket.host` muss `0.0.0.0` sein (nicht `127.0.0.1`), damit Docker-proxy die Verbindung von der Host-Bridge-IP an den Container weiterleiten kann.
+- `NANOBOT_WEBUI_SECRET` und alle Passwörter: Nur ASCII-Zeichen (Python 3.12 `hmac.compare_digest` unterstützt keine nicht-ASCII-Strings).
+- `.env`-Änderungen erfordern `docker compose down && docker compose up -d` (ein `docker restart` reicht nicht, env vars sind beim Container-Start eingefroren).
+
 ### GitHub Channel (`nanobot/channels/github.py`)
 
 A new channel that receives GitHub webhooks and posts comments to issues/PRs.

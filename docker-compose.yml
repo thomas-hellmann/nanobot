@@ -23,6 +23,8 @@ services:
       - VIRTUAL_HOST=nanobot.th-dev.eu
       - VIRTUAL_PORT=8080
       - LETSENCRYPT_HOST=nanobot.th-dev.eu
+    # SSH tunnel access requires channels.websocket.host=0.0.0.0 in config.json
+    # (Docker-proxy connects via bridge IP, not container loopback)
     ports:
       - "127.0.0.1:18790:18790"
       - "127.0.0.1:8765:8765"
